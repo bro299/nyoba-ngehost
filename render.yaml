@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: asisten-keuangan-umkm
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: FLASK_ENV
+        value: production
+      - key: KOLOSAL_API_KEY
+        fromSecret: KOLOSAL_API_KEY
