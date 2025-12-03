@@ -2,10 +2,11 @@ services:
   - type: web
     name: asisten-keuangan-umkm
     env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app
+    region: singapore
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT
     envVars:
       - key: FLASK_ENV
         value: production
       - key: KOLOSAL_API_KEY
-        fromSecret: KOLOSAL_API_KEY
+        sync: false
