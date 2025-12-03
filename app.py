@@ -18,7 +18,6 @@ app = Flask(__name__, static_folder='public', static_url_path='')
 CORS(app)
 
 # KONFIGURASI API KOLOSAL AI
-# Render.com akan membaca dari environment variables
 API_KEY = os.getenv("KOLOSAL_API_KEY")
 KOLOSAL_BASE_URL = "https://api.kolosal.ai/v1"
 MODEL_NAME = "Claude Sonnet 4.5"
@@ -63,8 +62,12 @@ def allowed_file(filename):
 
 def encode_image_to_base64(image_path):
     """Mengubah file gambar menjadi string base64"""
-    with open(image_path, "rb") as image_file:
-        return base64.b64encode(image_file.read()).decode('utf-8')
+    try:
+        with open(image_path, "rb") as image_file:
+            return base64.b64encode(image_file.read()).decode('utf-8')
+    except Exception as e:
+        print(f"Error encoding image: {e}")
+        return None
 
 def extract_text_from_pdf(file_path):
     """Mengekstrak teks dari file PDF"""
@@ -80,32 +83,48 @@ def extract_text_from_pdf(file_path):
         text = f"[Error membaca PDF: {e}]"
     return text
 
-def process_video_frames(video_path):
+def process_video_frames(video_path, max_frames=3):
     """
-    Mengambil 3 frame dari video (awal, tengah, akhir) untuk analisis AI.
+    Mengambil frame dari video untuk analisis AI.
+    max_frames: jumlah maksimal frame yang diambil
     """
     frames_base64 = []
-    cap = cv2.VideoCapture(video_path)
+    cap = None
+    
+    try:
+        cap = cv2.VideoCapture(video_path)
 
-    if not cap.isOpened():
-        return []
+        if not cap.isOpened():
+            print("Error: Tidak bisa membuka video")
+            return []
 
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    if total_frames == 0:
-        return []
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames == 0:
+            print("Error: Video tidak memiliki frame")
+            return []
 
-    # Ambil frame di titik 10%, 50%, dan 90% durasi
-    points = [int(total_frames * 0.1), int(total_frames * 0.5), int(total_frames * 0.9)]
+        # Ambil frame di titik yang merata
+        points = [int(total_frames * (i + 1) / (max_frames + 1)) for i in range(max_frames)]
 
-    for p in points:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, p)
-        ret, frame = cap.read()
-        if ret:
-            frame = cv2.resize(frame, (640, 360))
-            _, buffer = cv2.imencode('.jpg', frame)
-            frames_base64.append(base64.b64encode(buffer).decode('utf-8'))
+        for p in points:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, p)
+            ret, frame = cap.read()
+            if ret:
+                # Resize untuk menghemat bandwidth
+                frame = cv2.resize(frame, (640, 360))
+                _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                frames_base64.append(base64.b64encode(buffer).decode('utf-8'))
+            
+            # Break jika sudah cukup frame
+            if len(frames_base64) >= max_frames:
+                break
 
-    cap.release()
+    except Exception as e:
+        print(f"Error processing video: {e}")
+    finally:
+        if cap is not None:
+            cap.release()
+    
     return frames_base64
 
 # --- Integrasi AI ---
@@ -128,22 +147,24 @@ def call_ai_api(user_text, context_data):
         user_content.append({"type": "text", "text": f"\n\nISI DOKUMEN:\n{context_data['content']}"})
 
     elif context_data['type'] == 'image':
-        user_content.append({
-            "type": "image_url",
-            "image_url": {
-                "url": f"data:image/jpeg;base64,{context_data['content']}"
-            }
-        })
-
-    elif context_data['type'] == 'video_frames':
-        user_content.append({"type": "text", "text": "Berikut adalah beberapa frame dari video yang diunggah user:"})
-        for frame in context_data['content']:
+        if context_data['content']:
             user_content.append({
                 "type": "image_url",
                 "image_url": {
-                    "url": f"data:image/jpeg;base64,{frame}"
+                    "url": f"data:image/jpeg;base64,{context_data['content']}"
                 }
             })
+
+    elif context_data['type'] == 'video_frames':
+        if context_data['content']:
+            user_content.append({"type": "text", "text": "Berikut adalah beberapa frame dari video yang diunggah user:"})
+            for frame in context_data['content']:
+                user_content.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/jpeg;base64,{frame}"
+                    }
+                })
 
     try:
         response = ai_client.chat.completions.create(
@@ -166,64 +187,88 @@ def call_ai_api(user_text, context_data):
 @app.route('/')
 def index():
     """Serve frontend dari folder public"""
-    return send_from_directory('public', 'index.html')
+    try:
+        return send_from_directory('public', 'index.html')
+    except Exception as e:
+        return jsonify({
+            "error": "Frontend tidak ditemukan",
+            "message": "Pastikan folder 'public' dan file 'index.html' ada"
+        }), 404
 
 @app.route('/health')
 def health():
     """Health check endpoint untuk Render.com"""
     return jsonify({
         "status": "healthy",
-        "api_configured": ai_client is not None
+        "api_configured": ai_client is not None,
+        "api_key_set": API_KEY is not None
     })
 
 @app.route('/api/chat', methods=['POST'])
 def chat():
-    user_message = request.form.get('message', '')
-    context_data = {'type': 'none', 'content': ''}
+    try:
+        user_message = request.form.get('message', '')
+        
+        if not user_message:
+            return jsonify({"error": "Pesan tidak boleh kosong"}), 400
+        
+        context_data = {'type': 'none', 'content': ''}
 
-    if 'file' in request.files:
-        file = request.files['file']
-        if file and allowed_file(file.filename):
-            filename = secure_filename(file.filename)
-            file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-            file.save(file_path)
+        if 'file' in request.files:
+            file = request.files['file']
+            if file and file.filename and allowed_file(file.filename):
+                filename = secure_filename(file.filename)
+                file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+                file.save(file_path)
 
-            ext = filename.rsplit('.', 1)[1].lower()
+                ext = filename.rsplit('.', 1)[1].lower()
 
-            # Proses berdasarkan tipe file
-            if ext == 'pdf' or ext == 'txt':
-                context_data['type'] = 'text'
-                if ext == 'pdf':
-                    context_data['content'] = extract_text_from_pdf(file_path)
-                else:
-                    try:
-                        context_data['content'] = open(file_path, 'r', encoding='utf-8').read()
-                    except Exception as e:
-                        context_data['content'] = f"[Gagal membaca teks file: {e}]"
+                # Proses berdasarkan tipe file
+                if ext == 'pdf' or ext == 'txt':
+                    context_data['type'] = 'text'
+                    if ext == 'pdf':
+                        context_data['content'] = extract_text_from_pdf(file_path)
+                    else:
+                        try:
+                            with open(file_path, 'r', encoding='utf-8') as f:
+                                context_data['content'] = f.read()
+                        except Exception as e:
+                            context_data['content'] = f"[Gagal membaca teks file: {e}]"
 
-            elif ext in ['jpg', 'jpeg', 'png']:
-                context_data['type'] = 'image'
-                context_data['content'] = encode_image_to_base64(file_path)
+                elif ext in ['jpg', 'jpeg', 'png']:
+                    context_data['type'] = 'image'
+                    encoded = encode_image_to_base64(file_path)
+                    if encoded:
+                        context_data['content'] = encoded
+                    else:
+                        return jsonify({"error": "Gagal membaca gambar"}), 400
 
-            elif ext in ['mp4', 'mov', 'avi']:
-                frames = process_video_frames(file_path)
-                if frames:
-                    context_data['type'] = 'video_frames'
-                    context_data['content'] = frames
-                else:
-                    return jsonify({"reply": "❌ Gagal membaca video."})
+                elif ext in ['mp4', 'mov', 'avi']:
+                    frames = process_video_frames(file_path, max_frames=3)
+                    if frames:
+                        context_data['type'] = 'video_frames'
+                        context_data['content'] = frames
+                    else:
+                        return jsonify({"error": "❌ Gagal membaca video"}), 400
 
-            # Hapus file setelah diproses untuk hemat storage
-            try:
-                os.remove(file_path)
-            except:
-                pass
+                # Hapus file setelah diproses untuk hemat storage
+                try:
+                    os.remove(file_path)
+                except Exception as e:
+                    print(f"Warning: Gagal menghapus file {file_path}: {e}")
 
-    ai_reply = call_ai_api(user_message, context_data)
+        ai_reply = call_ai_api(user_message, context_data)
 
-    return jsonify({
-        "reply": ai_reply
-    })
+        return jsonify({
+            "reply": ai_reply
+        })
+    
+    except Exception as e:
+        print(f"Error in chat endpoint: {e}")
+        return jsonify({
+            "error": "Terjadi kesalahan pada server",
+            "message": str(e)
+        }), 500
 
 if __name__ == '__main__':
     # Gunakan port dari environment variable (untuk Render.com)
